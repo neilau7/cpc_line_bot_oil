@@ -41,6 +41,9 @@ client = AzureOpenAI(
     api_version=config["AzureOpenAI"]["VERSION"],
     azure_endpoint=config["AzureOpenAI"]["BASE"],
 )
+# weather API Key
+weather_api_key = config["WeatherAPI"]["KEY"]
+
 
 # Flask Web Server
 app = Flask(__name__)
@@ -120,7 +123,7 @@ def message_text(event):
         conversation_history[user_id] = [
             {
                 "role": "system",
-                "content": "你是一位專業加油員，你可以協助使用者完成一筆加油交易，一筆交易包含：加油站點、油品、金額或公升數、付款方式等資訊。請一律用繁體中文來回答。"
+                "content": "你是一位專業加油員，你可以協助使用者完成一筆加油交易，一筆交易包含：加油站點、油品、金額或公升數、付款方式等資訊。請一律用繁體中文來回答。如果使用者只是查詢油價，請只回覆油價資訊，不要主動執行加油交易。"
             }
         ]
 
@@ -128,20 +131,32 @@ def message_text(event):
     conversation_history[user_id].append({"role": "user", "content": user_input})
 
     with ApiClient(configuration) as api_client:
-        isFunctionCall, response, oil, amt, liter, pay = azure_openai(user_id)
+        isFunctionCall, function_name, response, oil, amt, liter, pay = azure_openai(user_id)
 
         this_messages = []
         if isFunctionCall:
-            this_messages.append(TextMessage(text="你想要做的交易是：" + oil + "，金額：" + amt + "，公升數：" + liter + "，付款方式：" + pay))
-            success, island, gun, time = saveTran(oil, amt, liter, pay)
-            if success:
-                this_messages.append(TextMessage(text=f"交易成功！\n您加注的油品為 {oil} \n付款方式為 {pay}"))
-                if amt != "N/A":
-                    this_messages.append(TextMessage(text="交易金額：" + amt + " 元"))
-                if liter != "N/A":
-                    this_messages.append(TextMessage(text="公升數：" + liter + " 公升"))
+            if function_name == "get_price":
+                this_messages.append(TextMessage(text="目前油品牌價如下：\n" + response))
+            elif function_name == "save_user_info":
+            
+                this_messages.append(TextMessage(text="你想要做的交易是：" + oil + "，金額：" + amt + "，公升數：" + liter + "，付款方式：" + pay))
+                success, island, gun, time = saveTran(oil, amt, liter, pay)
+                if success:
+                    this_messages.append(TextMessage(text=f"交易成功！\n您加注的油品為 {oil} \n付款方式為 {pay}"))
+                    if amt != "N/A":
+                        this_messages.append(TextMessage(text="交易金額：" + amt + " 元"))
+                    if liter != "N/A":
+                        this_messages.append(TextMessage(text="公升數：" + liter + " 公升"))
+                else:
+                    this_messages.append(TextMessage(text="交易失敗，請重新嘗試！"))
+            elif function_name == "get_weather":
+                if "error" not in response:
+                    weather_info = "\n".join([f"{key}：{value}" for key, value in response.items()])
+                    this_messages.append(TextMessage(text="目前天氣狀況如下：\n" + weather_info))
+                else:
+                    this_messages.append(TextMessage(text="查詢天氣失敗，原因：" + response["error"]))
             else:
-                this_messages.append(TextMessage(text="交易失敗，請重新嘗試！"))
+                this_messages.append(TextMessage(text="發生錯誤，請重新嘗試！"))
         else:
             this_messages.append(TextMessage(text=response))
 
@@ -157,26 +172,56 @@ def message_text(event):
 # Azure OpenAI Function
 # ----------------------------
 def azure_openai(user_id):
+    """
+    支援多步 function call：
+    1. 先執行 function
+    2. 把結果加入 conversation_history
+    3. 再呼叫 OpenAI，讓 AI 根據結果決定下一步
+    """
     global conversation_history
     messages = conversation_history[user_id]
 
     functions = [
         {
             "name": "save_user_info",
-            "description": "Save user info to database，including: 油品、金額或公升數、付款方式，最後回傳交易資料(島號、槍號、時間、交易金額)與成功與否",
+            "description": "Save user info to database，包含油品、金額、公升數、付款方式",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "oil": {"type": "string", "description": "油品,例如：九五無鉛、九八無鉛、柴油等"},
-                    "amt": {"type": "string", "description": "交易金額"},
-                    "liter": {"type": "string", "description": "公升數"},
-                    "pay": {"type": "string", "description": "付款方式,例如：信用卡、條碼支付、現金等．若無法取得，請填寫N/A"},
+                    "oil": {"type": "string"},
+                    "amt": {"type": "string"},
+                    "liter": {"type": "string"},
+                    "pay": {"type": "string"}
                 },
-                "required": ["oil", "pay"],
-            },
+                "required": ["oil", "pay"]
+            }
+        },
+        {
+            "name": "get_price",
+            "description": "取得油品牌價",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_name": {"type": "string"},
+                    "all_results": {"type": "boolean"}
+                },
+                "required": ["all_results"]
+            }
+        },
+        {
+            "name": "get_weather",
+            "description": "查詢台灣指定城市即時天氣",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"}
+                },
+                "required": ["city"]
+            }
         }
     ]
 
+    # 先呼叫一次
     completion = client.chat.completions.create(
         model=config["AzureOpenAI"]["DEPLOYMENT_NAME"],
         messages=messages,
@@ -185,28 +230,108 @@ def azure_openai(user_id):
         top_p=0.95,
         frequency_penalty=0,
         presence_penalty=0,
-        stop=None,
+        stop=None
     )
 
     completion_message = completion.choices[0].message
 
-    # 把 AI 回覆存到對話
+    # 如果 AI 回覆內容直接在 content 中
     if completion_message.content:
         conversation_history[user_id].append({"role": "assistant", "content": completion_message.content})
 
-    if completion.choices[0].finish_reason == "function_call":
+    # 如果 AI 想呼叫 function
+    while completion.choices[0].finish_reason == "function_call":
         this_arguments = json.loads(completion_message.function_call.arguments)
         function_name = completion_message.function_call.name
-        if function_name == "save_user_info":
+
+        # -------------------------
+        # 處理 get_weather
+        # -------------------------
+        if function_name == "get_weather":
+            city = this_arguments["city"]
+            weather_info = get_weather(city)
+
+            # 把 function 執行結果加入 conversation_history
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": json.dumps(weather_info, ensure_ascii=False)
+            })
+
+        # -------------------------
+        # 處理 get_price
+        # -------------------------
+        elif function_name == "get_price":
+            product_name = this_arguments.get("product_name")
+            all_results = this_arguments.get("all_results", True)
+            price_info = getPrice(product_name, all_results)
+
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": price_info
+            })
+
+        # -------------------------
+        # 處理 save_user_info
+        # -------------------------
+        elif function_name == "save_user_info":
             oil = this_arguments["oil"]
-            amt = this_arguments["amt"] if "amt" in this_arguments else "N/A"
-            liter = this_arguments["liter"] if "liter" in this_arguments else "N/A"
+            amt = this_arguments.get("amt", "N/A")
+            liter = this_arguments.get("liter", "N/A")
             pay = this_arguments["pay"]
-            return True, "need to call funcation", oil, amt, liter, pay
+
+            # 模擬存資料
+            success, island, gun, time = saveTran(oil, amt, liter, pay)
+            function_result = {
+                "success": success,
+                "oil": oil,
+                "amt": amt,
+                "liter": liter,
+                "pay": pay,
+                "island": island,
+                "gun": gun,
+                "time": time
+            }
+
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": json.dumps(function_result, ensure_ascii=False)
+            })
+
         else:
-            return False, "function name error", "unknown", "unknown", "unknown", "unknown"
-    else:
-        return False, completion_message.content, "unknown", "unknown", "unknown", "unknown"
+            # 如果 AI 呼叫未知 function
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": "function name error"
+            })
+
+        # 執行完 function，再丟一次給 AI 讓它決定下一步
+        completion = client.chat.completions.create(
+            model=config["AzureOpenAI"]["DEPLOYMENT_NAME"],
+            messages=conversation_history[user_id],
+            functions=functions,
+            max_tokens=800,
+            top_p=0.95,
+            frequency_penalty=0,
+            presence_penalty=0,
+            stop=None
+        )
+        completion_message = completion.choices[0].message
+        if completion_message.content:
+            conversation_history[user_id].append({"role": "assistant", "content": completion_message.content})
+
+    # 最終回傳結果
+    # 判斷最後一次是不是 save_user_info 的結果
+    for msg in reversed(conversation_history[user_id]):
+        if msg["role"] == "function" and "oil" in msg["content"]:
+            data = json.loads(msg["content"])
+            return True, "save_user_info", "交易完成", data["oil"], data["amt"], data["liter"], data["pay"]
+
+    # 如果沒有 function 執行
+    return False, "unknown", completion_message.content, "unknown", "unknown", "unknown", "unknown"
 
 # ----------------------------
 # 模擬交易 (假的 DB 存取)
@@ -224,6 +349,71 @@ def saveTran(oil, amt, liter, pay):
         success = False
 
     return success, island, gun, time
+
+def getPrice(product_name=None, all_results=True):
+
+    print("getPrice called with:", product_name, all_results)
+    import xml.etree.ElementTree as ET
+    import urllib3
+    import requests
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    url = "https://vipmbr.cpc.com.tw/CPCSTN/ListPriceWebService.asmx/getCPCMainProdListPrice_XML"
+    res = requests.get(url, verify=False)
+    root = ET.fromstring(res.text)
+
+    prices = []
+    for table in root.findall("Table"):
+        product = table.find("產品名稱").text
+        price = table.find("參考牌價_金額").text
+        date = table.find("牌價生效日期").text
+
+        if all_results:  # 🔹 全部
+            prices.append(f"{product}: {price} 元 (生效日 {date})")
+        elif product_name and product_name in product:  # 🔹 單一
+            return f"{product}: {price} 元 (生效日 {date})"
+
+    if not all_results and product_name:
+        return f"查無 {product_name} 的油價資訊"
+
+    return "\n".join(prices)
+
+def get_weather(city: str) -> dict:
+    """
+    使用 WeatherAPI 查詢指定台灣地區的即時天氣
+
+    :param city: 城市名稱（例如 "Taipei", "Kaohsiung", "Tainan", "Taichung"）
+    :param api_key: 你的 WeatherAPI 金鑰
+    :return: dict 格式，包含溫度、天氣狀況、濕度、風速
+    """
+    url = f"http://api.weatherapi.com/v1/current.json?key={weather_api_key}&q={city},Taiwan&lang=zh"
+    response = requests.get(url)
+    
+    if response.status_code != 200:
+        return {"error": f"查詢失敗，狀態碼 {response.status_code}"}
+    
+    data = response.json()
+    
+    if "error" in data:
+        return {"error": data["error"]["message"]}
+    
+    # 整理資料
+    result = {
+        "地點": data["location"]["name"],
+        "時間": data["location"]["localtime"],
+        "氣溫(°C)": data["current"]["temp_c"],
+        "體感溫度(°C)": data["current"]["feelslike_c"],
+        "天氣": data["current"]["condition"]["text"],
+        "濕度(%)": data["current"]["humidity"],
+        "風速(kph)": data["current"]["wind_kph"]
+    }
+    return result
+
+
+
+
+
 
 # ----------------------------
 # Main
