@@ -243,7 +243,22 @@ def azure_openai(user_id):
                 },
                 "required": ["keyword"]
             }
+        },
+        {
+            "name": "get_gas_station_link",
+            "description": "根據加油站名稱或地址生成 Google Maps 導航連結",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "station_name": {
+                        "type": "string",
+                        "description": "加油站名稱或地址，例如 'CPC 台北車站站'"
+                    }
+                },
+                "required": ["station_name"]
+            }
         }
+
 
 
     ]
@@ -298,7 +313,20 @@ def azure_openai(user_id):
                 "name": function_name,
                 "content": price_info
             })
+         # -------------------------
+    # 處理加油站導航
+    # -------------------------
+        elif function_name == "get_gas_station_link":
+            station_name = this_arguments["station_name"]
+            import urllib.parse
+            query = urllib.parse.quote(station_name)
+            link = f"https://www.google.com/maps/search/?api=1&query={query}"
 
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": link
+            })
         # -------------------------
         # 處理 save_user_info
         # -------------------------
@@ -425,6 +453,18 @@ def find_gas_stations(keyword: str, radius_km: float = 5.0) -> str:
         lines.append(f"{name} | {address} | {is_open} | 有咖啡/便利店: {has_coffee}")
 
     return "\n".join(lines)
+
+def get_gas_station_link(station_name: str) -> str:
+    """
+    生成 Google Maps 導航連結
+    :param station_name: 加油站名稱或地址
+    :return: 可點擊的導航網址
+    """
+    # URL 編碼
+    import urllib.parse
+    query = urllib.parse.quote(station_name)
+    return f"https://www.google.com/maps/search/?api=1&query={query}"
+
 
 def getPrice(product_name=None, all_results=True):
 
