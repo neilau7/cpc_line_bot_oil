@@ -5,6 +5,8 @@ import os
 import logging
 from datetime import datetime
 
+import googlemaps
+
 # Azure OpenAI
 from openai import AzureOpenAI
 
@@ -44,6 +46,10 @@ client = AzureOpenAI(
 # weather API Key
 weather_api_key = config["WeatherAPI"]["KEY"]
 
+# Google Maps API Key
+googlemap_api_key = config["GoogleMapAPI"]["KEY"]
+# 初始化 client
+gmaps = googlemaps.Client(key=googlemap_api_key)
 
 # Flask Web Server
 app = Flask(__name__)
@@ -218,7 +224,28 @@ def azure_openai(user_id):
                 },
                 "required": ["city"]
             }
+        },
+        {
+            "name": "find_gas_stations",
+            "description": "查詢指定地點附近加油站，回傳名稱、地址、營業狀態，並標註是否有咖啡或便利店。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "搜尋地點的關鍵字，例如 '台北車站', '中正區'。"
+                },
+                "radius_km": {
+                    "type": "number",
+                    "description": "搜尋半徑，單位為公里，預設 5 公里。",
+                    "default": 5
+                }
+                },
+                "required": ["keyword"]
+            }
         }
+
+
     ]
 
     # 先呼叫一次
@@ -299,7 +326,16 @@ def azure_openai(user_id):
                 "name": function_name,
                 "content": json.dumps(function_result, ensure_ascii=False)
             })
+        elif function_name == "find_gas_stations":
+            keyword = this_arguments["keyword"]
+            radius_km = this_arguments.get("radius_km", 5)
+            gas_station_info = find_gas_stations(keyword, radius_km)
 
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": gas_station_info
+            })
         else:
             # 如果 AI 呼叫未知 function
             conversation_history[user_id].append({
@@ -349,6 +385,46 @@ def saveTran(oil, amt, liter, pay):
         success = False
 
     return success, island, gun, time
+
+def find_gas_stations(keyword: str, radius_km: float = 5.0) -> str:
+    """
+    查詢指定地點附近加油站
+    :param keyword: 地名或地址，例如 "台北車站"
+    :param radius_km: 搜尋範圍，單位公里，預設 5 公里
+    :return: 字串，包含每個加油站名稱、地址、營業狀態、是否有咖啡/便利店
+    """
+    # 1. 將使用者輸入轉成經緯度
+    geocode_result = gmaps.geocode(keyword, language="zh-TW")
+    if not geocode_result:
+        return f"找不到地點：{keyword}"
+
+    location = geocode_result[0]['geometry']['location']
+    latlng = (location['lat'], location['lng'])
+
+    # 2. 搜尋附近加油站
+    radius_m = int(radius_km * 1000)  # 公尺
+    places_result = gmaps.places_nearby(
+        location=latlng,
+        radius=radius_m,
+        type="gas_station",
+        language="zh-TW"
+    )
+
+    if not places_result.get('results'):
+        return f"{keyword} 附近沒有找到加油站"
+
+    # 3. 整理結果為字串
+    lines = []
+    for place in places_result['results']:
+        name = place['name']
+        address = place.get('vicinity', "無地址")
+        opening_hours = place.get('opening_hours', {}).get('open_now')
+        is_open = "營業中" if opening_hours else "休息中"
+        types = place.get('types', [])
+        has_coffee = "cafe" in types or "convenience_store" in types
+        lines.append(f"{name} | {address} | {is_open} | 有咖啡/便利店: {has_coffee}")
+
+    return "\n".join(lines)
 
 def getPrice(product_name=None, all_results=True):
 
