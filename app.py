@@ -216,11 +216,21 @@ def azure_openai(user_id):
         },
         {
             "name": "get_weather",
-            "description": "查詢台灣指定城市即時天氣",
+            "description": "查詢台灣指定城市即時或未來天氣",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string"}
+                    "city": {
+                        "type": "string",
+                        "description": "城市名稱，例如 Taipei、Kaohsiung、Tainan、Taichung"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "查詢天數，0 表示即時天氣，1-7 表示未來天氣（含今天）",
+                        "minimum": 0,
+                        "maximum": 7,
+                        "default": 0
+                    }
                 },
                 "required": ["city"]
             }
@@ -291,7 +301,8 @@ def azure_openai(user_id):
         # -------------------------
         if function_name == "get_weather":
             city = this_arguments["city"]
-            weather_info = get_weather(city)
+            days = this_arguments.get("days", 0)
+            weather_info = get_weather(city, days)
 
             # 把 function 執行結果加入 conversation_history
             conversation_history[user_id].append({
@@ -498,35 +509,64 @@ def getPrice(product_name=None, all_results=True):
 
     return "\n".join(prices)
 
-def get_weather(city: str) -> dict:
+def get_weather(city: str, days: int = 0) -> dict:
     """
-    使用 WeatherAPI 查詢指定台灣地區的即時天氣
-
-    :param city: 城市名稱（例如 "Taipei", "Kaohsiung", "Tainan", "Taichung"）
-    :param api_key: 你的 WeatherAPI 金鑰
-    :return: dict 格式，包含溫度、天氣狀況、濕度、風速
-    """
-    url = f"http://api.weatherapi.com/v1/current.json?key={weather_api_key}&q={city},Taiwan&lang=zh"
-    response = requests.get(url)
+    使用 WeatherAPI 查詢指定台灣地區天氣
     
+    :param city: 城市名稱，例如 "Taipei", "Kaohsiung", "Tainan", "Taichung"
+    :param days: 查詢天數，0 表示即時天氣，1-7 表示未來天氣（含今天）
+    :return: dict 格式
+        - days=0 回傳即時天氣
+        - days>0 回傳未來天氣列表
+    """
+    import requests
+
+    days = min(days, 7)  # 限制最多 7 天
+
+    if days == 0:
+        # 即時天氣
+        url = f"http://api.weatherapi.com/v1/current.json?key={weather_api_key}&q={city},Taiwan&lang=zh"
+    else:
+        # 天氣預報
+        url = f"http://api.weatherapi.com/v1/forecast.json?key={weather_api_key}&q={city},Taiwan&days={days}&lang=zh"
+
+    response = requests.get(url)
     if response.status_code != 200:
         return {"error": f"查詢失敗，狀態碼 {response.status_code}"}
-    
+
     data = response.json()
-    
     if "error" in data:
         return {"error": data["error"]["message"]}
-    
-    # 整理資料
-    result = {
-        "地點": data["location"]["name"],
-        "時間": data["location"]["localtime"],
-        "氣溫(°C)": data["current"]["temp_c"],
-        "體感溫度(°C)": data["current"]["feelslike_c"],
-        "天氣": data["current"]["condition"]["text"],
-        "濕度(%)": data["current"]["humidity"],
-        "風速(kph)": data["current"]["wind_kph"]
-    }
+
+    if days == 0:
+        # 即時天氣
+        result = {
+            "地點": data["location"]["name"],
+            "時間": data["location"]["localtime"],
+            "氣溫(°C)": data["current"]["temp_c"],
+            "體感溫度(°C)": data["current"]["feelslike_c"],
+            "天氣": data["current"]["condition"]["text"],
+            "濕度(%)": data["current"]["humidity"],
+            "風速(kph)": data["current"]["wind_kph"]
+        }
+    else:
+        # 未來天氣
+        forecast_list = []
+        for day in data["forecast"]["forecastday"]:
+            forecast_list.append({
+                "日期": day["date"],
+                "平均氣溫(°C)": day["day"]["avgtemp_c"],
+                "最高氣溫(°C)": day["day"]["maxtemp_c"],
+                "最低氣溫(°C)": day["day"]["mintemp_c"],
+                "天氣": day["day"]["condition"]["text"],
+                "降雨機率(%)": day["day"].get("daily_chance_of_rain", "N/A"),
+                "平均濕度(%)": day["day"]["avghumidity"]
+            })
+        result = {
+            "地點": data["location"]["name"],
+            "預報": forecast_list
+        }
+
     return result
 
 
