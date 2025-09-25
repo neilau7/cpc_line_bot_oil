@@ -7,6 +7,11 @@ from datetime import datetime
 
 import googlemaps
 
+from matplotlib import rcParams
+
+# 指定中文字體，例如蘋果系統常用的 Heiti
+rcParams['font.family'] = 'AppleGothic'
+
 # Azure OpenAI
 from openai import AzureOpenAI
 
@@ -36,6 +41,8 @@ from linebot.models import FollowEvent
 # ----------------------------
 config = configparser.ConfigParser()
 config.read("config.ini")
+sever_url = config["Server"]["URL"] # external url
+
 
 # Azure OpenAI Key
 client = AzureOpenAI(
@@ -80,6 +87,11 @@ configuration = Configuration(access_token=channel_access_token)
 # 全域變數
 # ----------------------------
 conversation_history = {}   # 每個使用者的對話紀錄
+
+## image route
+@app.route("/static/<path:filename>")
+def serve_static(filename):
+    return send_from_directory("static", filename)
 
 # ----------------------------
 # Callback
@@ -215,8 +227,8 @@ def azure_openai(user_id):
             }
         },
         {
-            "name": "get_weather",
-            "description": "查詢台灣指定城市即時或未來天氣",
+            "name": "get_weather_chart",
+            "description": "查詢台灣指定城市未來天氣，但需說明要查詢溫度還是降雨機率，最後生成圖表",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -226,15 +238,23 @@ def azure_openai(user_id):
                     },
                     "days": {
                         "type": "integer",
-                        "description": "查詢天數，0 表示即時天氣，1-7 表示未來天氣（含今天）",
-                        "minimum": 0,
+                        "description": "查詢天數，1-7 表示未來天氣（含今天）",
+                        "minimum": 1,
                         "maximum": 7,
-                        "default": 0
+                        "default": 7
+                    },
+                    "show": {
+                        "type": "string",
+                        "description": "圖表顯示內容：weather代表氣溫或是溫度, rain代表降雨機率",
+                        "default": "weather"
                     }
                 },
-                "required": ["city"]
+                "required": ["city","show"]
             }
         },
+
+
+
         {
             "name": "find_gas_stations",
             "description": "查詢指定地點附近加油站，回傳名稱、地址、營業狀態，並標註是否有咖啡或便利店。",
@@ -302,7 +322,48 @@ def azure_openai(user_id):
         if function_name == "get_weather":
             city = this_arguments["city"]
             days = this_arguments.get("days", 0)
+
+            # 查天氣
             weather_info = get_weather(city, days)
+
+            # 把 function 執行結果加入 conversation_history
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": json.dumps(weather_info, ensure_ascii=False)
+            })
+
+            # 準備 LINE 回覆訊息
+            if days == 0:
+                text = (
+                    f"{weather_info['地點']} 現在天氣：{weather_info['天氣']}\n"
+                    f"氣溫 {weather_info['氣溫(°C)']}°C，體感 {weather_info['體感溫度(°C)']}°C\n"
+                    f"濕度 {weather_info['濕度(%)']}%，風速 {weather_info['風速(kph)']} kph\n"
+                    f"降雨量 {weather_info.get('降雨量(mm)', 0)} mm"
+                )
+            else:
+                lines = [f"{weather_info['地點']} 未來 {days} 天預報："]
+                for day in weather_info["預報"]:
+                    lines.append(
+                        f"- {day['日期']}: {day['天氣']}, 最高 {day['最高氣溫(°C)']}°C, "
+                        f"最低 {day['最低氣溫(°C)']}°C, 降雨機率 {day.get('降雨機率(%)', 0)}%"
+                    )
+                text = "\n".join(lines)
+
+            reply_messages = [TextMessage(text=text)]
+
+
+        elif function_name == "get_weather_chart":
+            city = this_arguments["city"]
+            days = this_arguments.get("days", 7)  # 預設未來 7 天
+            show = this_arguments.get("show", "weather")  # "weather" 或 "rain"
+
+            # 呼叫新函數取得資料與圖表
+            weather_info = get_weather_chart(city, days, show)
+            chart_file = weather_info.get("chart_path", None)
+
+            # 如果有圖表，提供完整 URL
+            weather_info["imgurl"] = f"{sever_url}/static/{show.lower()}_{city.lower()}.png" if chart_file else None
 
             # 把 function 執行結果加入 conversation_history
             conversation_history[user_id].append({
@@ -511,23 +572,22 @@ def getPrice(product_name=None, all_results=True):
 
 def get_weather(city: str, days: int = 0) -> dict:
     """
-    使用 WeatherAPI 查詢指定台灣地區天氣
+    使用 WeatherAPI 查詢指定台灣地區天氣，並抓降雨資訊
     
     :param city: 城市名稱，例如 "Taipei", "Kaohsiung", "Tainan", "Taichung"
     :param days: 查詢天數，0 表示即時天氣，1-7 表示未來天氣（含今天）
     :return: dict 格式
-        - days=0 回傳即時天氣
-        - days>0 回傳未來天氣列表
+        - days=0 回傳即時天氣（含降雨量 mm）
+        - days>0 回傳未來天氣列表（含降雨機率 %）
     """
     import requests
 
     days = min(days, 7)  # 限制最多 7 天
 
+    # 設定 API URL
     if days == 0:
-        # 即時天氣
         url = f"http://api.weatherapi.com/v1/current.json?key={weather_api_key}&q={city},Taiwan&lang=zh"
     else:
-        # 天氣預報
         url = f"http://api.weatherapi.com/v1/forecast.json?key={weather_api_key}&q={city},Taiwan&days={days}&lang=zh"
 
     response = requests.get(url)
@@ -538,8 +598,8 @@ def get_weather(city: str, days: int = 0) -> dict:
     if "error" in data:
         return {"error": data["error"]["message"]}
 
+    # 即時天氣
     if days == 0:
-        # 即時天氣
         result = {
             "地點": data["location"]["name"],
             "時間": data["location"]["localtime"],
@@ -547,10 +607,11 @@ def get_weather(city: str, days: int = 0) -> dict:
             "體感溫度(°C)": data["current"]["feelslike_c"],
             "天氣": data["current"]["condition"]["text"],
             "濕度(%)": data["current"]["humidity"],
-            "風速(kph)": data["current"]["wind_kph"]
+            "風速(kph)": data["current"]["wind_kph"],
+            "降雨量(mm)": data["current"].get("precip_mm", 0)
         }
+    # 未來天氣
     else:
-        # 未來天氣
         forecast_list = []
         for day in data["forecast"]["forecastday"]:
             forecast_list.append({
@@ -559,7 +620,7 @@ def get_weather(city: str, days: int = 0) -> dict:
                 "最高氣溫(°C)": day["day"]["maxtemp_c"],
                 "最低氣溫(°C)": day["day"]["mintemp_c"],
                 "天氣": day["day"]["condition"]["text"],
-                "降雨機率(%)": day["day"].get("daily_chance_of_rain", "N/A"),
+                "降雨機率(%)": day["day"].get("daily_chance_of_rain", 0),
                 "平均濕度(%)": day["day"]["avghumidity"]
             })
         result = {
@@ -568,6 +629,71 @@ def get_weather(city: str, days: int = 0) -> dict:
         }
 
     return result
+
+import matplotlib
+matplotlib.use("Agg")  # 非 GUI，純粹生成圖片檔案
+import matplotlib.pyplot as plt
+import os
+import requests
+
+def get_weather_chart(city: str, days: int = 7, show: str = "weather") -> dict:
+    """
+    取得未來 N 天天氣，生成折線圖
+    :param city: 城市名稱
+    :param days: 1~7 天
+    :param show: 'weather' 或 'rain'，決定圖表 y 軸顯示氣溫或降雨機率
+    :return: dict，包含天氣資料與圖檔路徑
+    """
+    import requests, matplotlib.pyplot as plt, os
+
+    url = f"http://api.weatherapi.com/v1/forecast.json?key={weather_api_key}&q={city},Taiwan&days={days}&lang=zh"
+    resp = requests.get(url)
+    data = resp.json()
+    if resp.status_code != 200 or "error" in data:
+        return {"error": data.get("error", {}).get("message", "查詢失敗")}
+
+    forecast_list = []
+    dates, y_values = [], []
+
+    for day in data["forecast"]["forecastday"]:
+        d = day["date"]
+        dates.append(d)
+        if show == "rain":
+            y = day["day"].get("daily_chance_of_rain", 0)
+        else:
+            y = day["day"]["avgtemp_c"]
+        y_values.append(y)
+
+        forecast_list.append({
+            "日期": d,
+            "平均氣溫(°C)": day["day"]["avgtemp_c"],
+            "最高氣溫(°C)": day["day"]["maxtemp_c"],
+            "最低氣溫(°C)": day["day"]["mintemp_c"],
+            "天氣": day["day"]["condition"]["text"],
+            "降雨機率(%)": day["day"].get("daily_chance_of_rain", 0),
+            "平均濕度(%)": day["day"]["avghumidity"]
+        })
+
+    # 產生圖表
+    plt.figure(figsize=(10,6))
+    plt.plot(dates, y_values, marker='o', label=("降雨機率(%)" if show=="rain" else "平均氣溫(°C)"))
+    plt.title(f"{city} 未來 {days} 天{'降雨機率' if show=='rain' else '氣溫'}預報")
+    plt.xlabel("日期")
+    plt.ylabel("值")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+    os.makedirs("static", exist_ok=True)
+    chart_file = f"static/{show.lower()}_{city.lower()}.png"
+    plt.savefig(chart_file)
+    plt.close()
+
+    return {
+        "地點": city,
+        "預報": forecast_list,
+        "chart_path": chart_file
+    }
 
 
 
