@@ -268,7 +268,7 @@ def azure_openai(user_id):
         model=config["AzureOpenAI"]["DEPLOYMENT_NAME"],
         messages=messages,
         functions=functions,
-        max_tokens=800,
+        max_tokens=1500,
         top_p=0.95,
         frequency_penalty=0,
         presence_penalty=0,
@@ -450,6 +450,9 @@ def find_gas_stations(keyword: str, radius_km: float = 5.0) -> str:
         is_open = "營業中" if opening_hours else "休息中"
         types = place.get('types', [])
         has_coffee = "cafe" in types or "convenience_store" in types
+        if not has_coffee:
+            if "咖啡" in name:
+                has_coffee = True
         lines.append(f"{name} | {address} | {is_open} | 有咖啡/便利店: {has_coffee}")
 
     return "\n".join(lines)
