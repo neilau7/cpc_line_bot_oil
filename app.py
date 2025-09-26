@@ -55,6 +55,9 @@ weather_api_key = config["WeatherAPI"]["KEY"]
 
 # Google Maps API Key
 googlemap_api_key = config["GoogleMapAPI"]["KEY"]
+
+# News API Key
+news_api_key = config["NewsAPI"]["KEY"]
 # 初始化 client
 gmaps = googlemaps.Client(key=googlemap_api_key)
 
@@ -173,8 +176,15 @@ def message_text(event):
                     this_messages.append(TextMessage(text="目前天氣狀況如下：\n" + weather_info))
                 else:
                     this_messages.append(TextMessage(text="查詢天氣失敗，原因：" + response["error"]))
+            elif function_name == "get_news":
+                if isinstance(response, list) and len(response) > 0:
+                    news_list = "\n\n".join([f"📰 {item['title']}\n{item['url']}" for item in response])
+                    this_messages.append(TextMessage(text="以下是最新新聞：\n" + news_list))
+                else:
+                    this_messages.append(TextMessage(text="查無相關新聞，請換個關鍵字！"))
             else:
                 this_messages.append(TextMessage(text="發生錯誤，請重新嘗試！"))
+            
         else:
             this_messages.append(TextMessage(text=response))
 
@@ -196,6 +206,8 @@ def azure_openai(user_id):
     2. 把結果加入 conversation_history
     3. 再呼叫 OpenAI，讓 AI 根據結果決定下一步
     """
+    import json
+    import urllib.parse
     global conversation_history
     messages = conversation_history[user_id]
 
@@ -227,73 +239,55 @@ def azure_openai(user_id):
             }
         },
         {
-            "name": "get_weather_chart",
-            "description": "查詢台灣指定城市未來天氣，但需說明要查詢溫度還是降雨機率，最後生成圖表",
+            "name": "get_weather",
+            "description": "查詢即時天氣",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "城市名稱，例如 Taipei、Kaohsiung、Tainan、Taichung"
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "查詢天數，1-7 表示未來天氣（含今天）",
-                        "minimum": 1,
-                        "maximum": 7,
-                        "default": 7
-                    },
-                    "show": {
-                        "type": "string",
-                        "description": "圖表顯示內容：weather代表氣溫或是溫度, rain代表降雨機率",
-                        "default": "weather"
-                    }
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"}
                 },
-                "required": ["city","show"]
+                "required": ["city"]
             }
         },
-
-
-
         {
-            "name": "find_gas_stations",
-            "description": "查詢指定地點附近加油站，回傳名稱、地址、營業狀態，並標註是否有咖啡或便利店。",
+            "name": "get_news",
+            "description": "查詢新聞，依指定關鍵字回傳最新新聞列表",
             "parameters": {
                 "type": "object",
                 "properties": {
-                "keyword": {
-                    "type": "string",
-                    "description": "搜尋地點的關鍵字，例如 '台北車站', '中正區'。"
+                    "keyword": {"type": "string"},
+                    "limit": {"type": "integer"}
                 },
-                "radius_km": {
-                    "type": "number",
-                    "description": "搜尋半徑，單位為公里，預設 5 公里。",
-                    "default": 5
-                }
+                "required": []
+            }
+        },
+        {
+            "name": "find_gas_stations",
+            "description": "查詢指定地點附近加油站",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string"},
+                    "radius_km": {"type": "number"}
                 },
                 "required": ["keyword"]
             }
         },
         {
             "name": "get_gas_station_link",
-            "description": "根據加油站名稱或地址生成 Google Maps 導航連結",
+            "description": "生成加油站 Google Maps 導航連結",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "station_name": {
-                        "type": "string",
-                        "description": "加油站名稱或地址，例如 'CPC 台北車站站'"
-                    }
+                    "station_name": {"type": "string"}
                 },
                 "required": ["station_name"]
             }
         }
-
-
-
     ]
 
-    # 先呼叫一次
+    # 初始化第一次呼叫
     completion = client.chat.completions.create(
         model=config["AzureOpenAI"]["DEPLOYMENT_NAME"],
         messages=messages,
@@ -301,39 +295,33 @@ def azure_openai(user_id):
         max_tokens=1500,
         top_p=0.95,
         frequency_penalty=0,
-        presence_penalty=0,
-        stop=None
+        presence_penalty=0
     )
 
     completion_message = completion.choices[0].message
+    function_name = getattr(completion_message.function_call, "name", None)
 
     # 如果 AI 回覆內容直接在 content 中
     if completion_message.content:
         conversation_history[user_id].append({"role": "assistant", "content": completion_message.content})
 
-    # 如果 AI 想呼叫 function
-    while completion.choices[0].finish_reason == "function_call":
-        this_arguments = json.loads(completion_message.function_call.arguments)
-        function_name = completion_message.function_call.name
+    # 多步 function call
+    while getattr(completion_message, "function_call", None):
+        this_arguments = json.loads(completion_message.function_call.arguments or "{}")
 
         # -------------------------
-        # 處理 get_weather
+        # get_weather
         # -------------------------
         if function_name == "get_weather":
             city = this_arguments["city"]
             days = this_arguments.get("days", 0)
-
-            # 查天氣
             weather_info = get_weather(city, days)
-
-            # 把 function 執行結果加入 conversation_history
             conversation_history[user_id].append({
                 "role": "function",
                 "name": function_name,
                 "content": json.dumps(weather_info, ensure_ascii=False)
             })
-
-            # 準備 LINE 回覆訊息
+            # 準備回覆文字
             if days == 0:
                 text = (
                     f"{weather_info['地點']} 現在天氣：{weather_info['天氣']}\n"
@@ -349,68 +337,35 @@ def azure_openai(user_id):
                         f"最低 {day['最低氣溫(°C)']}°C, 降雨機率 {day.get('降雨機率(%)', 0)}%"
                     )
                 text = "\n".join(lines)
-
-            reply_messages = [TextMessage(text=text)]
-
-
-        elif function_name == "get_weather_chart":
-            city = this_arguments["city"]
-            days = this_arguments.get("days", 7)  # 預設未來 7 天
-            show = this_arguments.get("show", "weather")  # "weather" 或 "rain"
-
-            # 呼叫新函數取得資料與圖表
-            weather_info = get_weather_chart(city, days, show)
-            chart_file = weather_info.get("chart_path", None)
-
-            # 如果有圖表，提供完整 URL
-            weather_info["imgurl"] = f"{sever_url}/static/{show.lower()}_{city.lower()}.png" if chart_file else None
-
-            # 把 function 執行結果加入 conversation_history
             conversation_history[user_id].append({
                 "role": "function",
                 "name": function_name,
-                "content": json.dumps(weather_info, ensure_ascii=False)
+                "content": text
             })
 
         # -------------------------
-        # 處理 get_price
+        # get_price
         # -------------------------
         elif function_name == "get_price":
             product_name = this_arguments.get("product_name")
             all_results = this_arguments.get("all_results", True)
             price_info = getPrice(product_name, all_results)
-
             conversation_history[user_id].append({
                 "role": "function",
                 "name": function_name,
                 "content": price_info
             })
-         # -------------------------
-    # 處理加油站導航
-    # -------------------------
-        elif function_name == "get_gas_station_link":
-            station_name = this_arguments["station_name"]
-            import urllib.parse
-            query = urllib.parse.quote(station_name)
-            link = f"https://www.google.com/maps/search/?api=1&query={query}"
 
-            conversation_history[user_id].append({
-                "role": "function",
-                "name": function_name,
-                "content": link
-            })
         # -------------------------
-        # 處理 save_user_info
+        # save_user_info
         # -------------------------
         elif function_name == "save_user_info":
             oil = this_arguments["oil"]
             amt = this_arguments.get("amt", "N/A")
             liter = this_arguments.get("liter", "N/A")
             pay = this_arguments["pay"]
-
-            # 模擬存資料
             success, island, gun, time = saveTran(oil, amt, liter, pay)
-            function_result = {
+            result = {
                 "success": success,
                 "oil": oil,
                 "amt": amt,
@@ -420,31 +375,62 @@ def azure_openai(user_id):
                 "gun": gun,
                 "time": time
             }
-
             conversation_history[user_id].append({
                 "role": "function",
                 "name": function_name,
-                "content": json.dumps(function_result, ensure_ascii=False)
+                "content": json.dumps(result, ensure_ascii=False)
             })
+
+        # -------------------------
+        # find_gas_stations
+        # -------------------------
         elif function_name == "find_gas_stations":
             keyword = this_arguments["keyword"]
             radius_km = this_arguments.get("radius_km", 5)
             gas_station_info = find_gas_stations(keyword, radius_km)
-
             conversation_history[user_id].append({
                 "role": "function",
                 "name": function_name,
                 "content": gas_station_info
             })
+
+        # -------------------------
+        # get_gas_station_link
+        # -------------------------
+        elif function_name == "get_gas_station_link":
+            station_name = this_arguments["station_name"]
+            link = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(station_name)}"
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": link
+            })
+
+        # -------------------------
+        # get_news
+        # -------------------------
+        elif function_name == "get_news":
+            keyword = this_arguments.get("keyword", "中油")
+            news_result = get_news(keyword)  # 回傳 dict
+            news_list = news_result.get("新聞列表", [])  # 取出列表
+            if news_list:
+                news_info = "\n\n".join([f"📰 {item['標題']}\n{item['連結']}" for item in news_list])
+            else:
+                news_info = f"查無關鍵字 '{keyword}' 的新聞"
+            conversation_history[user_id].append({
+                "role": "function",
+                "name": function_name,
+                "content": news_info
+            })
+
         else:
-            # 如果 AI 呼叫未知 function
             conversation_history[user_id].append({
                 "role": "function",
                 "name": function_name,
                 "content": "function name error"
             })
 
-        # 執行完 function，再丟一次給 AI 讓它決定下一步
+        # 呼叫 AI 決定下一步
         completion = client.chat.completions.create(
             model=config["AzureOpenAI"]["DEPLOYMENT_NAME"],
             messages=conversation_history[user_id],
@@ -452,22 +438,27 @@ def azure_openai(user_id):
             max_tokens=800,
             top_p=0.95,
             frequency_penalty=0,
-            presence_penalty=0,
-            stop=None
+            presence_penalty=0
         )
         completion_message = completion.choices[0].message
+        function_name = getattr(completion_message.function_call, "name", None)
         if completion_message.content:
             conversation_history[user_id].append({"role": "assistant", "content": completion_message.content})
 
-    # 最終回傳結果
-    # 判斷最後一次是不是 save_user_info 的結果
+    # -------------------------
+    # 最終回傳
+    # -------------------------
     for msg in reversed(conversation_history[user_id]):
-        if msg["role"] == "function" and "oil" in msg["content"]:
-            data = json.loads(msg["content"])
-            return True, "save_user_info", "交易完成", data["oil"], data["amt"], data["liter"], data["pay"]
+        if msg["role"] == "function" and "oil" in msg.get("content", ""):
+            try:
+                data = json.loads(msg["content"])
+                return True, "save_user_info", "交易完成", data["oil"], data["amt"], data["liter"], data["pay"]
+            except:
+                return True, "save_user_info", msg["content"], "N/A", "N/A", "N/A", "N/A"
 
-    # 如果沒有 function 執行
-    return False, "unknown", completion_message.content, "unknown", "unknown", "unknown", "unknown"
+    if not function_name:
+        return False, "unknown", completion_message.content, "unknown", "unknown", "unknown", "unknown"
+    return True, function_name, completion_message.content, "N/A", "N/A", "N/A", "N/A"
 
 # ----------------------------
 # 模擬交易 (假的 DB 存取)
@@ -696,6 +687,49 @@ def get_weather_chart(city: str, days: int = 7, show: str = "weather") -> dict:
     }
 
 
+def get_news(keyword: str = "中油", limit: int = 5) -> dict:
+    """
+    使用 NewsAPI 查詢指定關鍵字的新聞
+    """
+    import requests
+    from datetime import datetime
+
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": keyword,
+        "language": "zh",
+        "sortBy": "publishedAt",
+        "pageSize": limit,
+        "apiKey": news_api_key
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        return {"關鍵字": keyword, "新聞列表": [], "error": str(e)}
+
+    news_list = []
+    for article in data.get("articles", []):
+        # 將時間轉成簡單格式
+        try:
+            pub_time = datetime.fromisoformat(article["publishedAt"].replace("Z", "+00:00"))
+            pub_time_str = pub_time.strftime("%Y-%m-%d %H:%M")
+        except:
+            pub_time_str = article["publishedAt"]
+
+        news_list.append({
+            "標題": article["title"],
+            "來源": article["source"]["name"],
+            "時間": pub_time_str,
+            "連結": article["url"]
+        })
+
+    return {
+        "關鍵字": keyword,
+        "新聞列表": news_list
+    }
 
 
 
