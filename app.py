@@ -445,16 +445,6 @@ def azure_openai(user_id):
         if completion_message.content:
             conversation_history[user_id].append({"role": "assistant", "content": completion_message.content})
 
-    # -------------------------
-    # 最終回傳
-    # -------------------------
-    for msg in reversed(conversation_history[user_id]):
-        if msg["role"] == "function" and "oil" in msg.get("content", ""):
-            try:
-                data = json.loads(msg["content"])
-                return True, "save_user_info", "交易完成", data["oil"], data["amt"], data["liter"], data["pay"]
-            except:
-                return True, "save_user_info", msg["content"], "N/A", "N/A", "N/A", "N/A"
 
     if not function_name:
         return False, "unknown", completion_message.content, "unknown", "unknown", "unknown", "unknown"
