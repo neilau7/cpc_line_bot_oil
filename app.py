@@ -10,7 +10,8 @@ import googlemaps
 from matplotlib import rcParams
 
 # 指定中文字體，例如蘋果系統常用的 Heiti
-rcParams['font.family'] = 'AppleGothic'
+#rcParams['font.family'] = 'AppleGothic'
+rcParams['font.family'] = 'Heiti TC'  # 或其他支援繁體中文的系統字型
 
 # Azure OpenAI
 from openai import AzureOpenAI
@@ -244,12 +245,26 @@ def azure_openai(user_id):
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string"},
+                    "city": {"type": "string", "description": "城市名稱，必須用英文表示，例如 Taipei, Kaohsiung, Tainan, Taichung"},
                     "days": {"type": "integer"}
                 },
                 "required": ["city"]
             }
         },
+        {
+            "name": "get_weather_chart",
+            "description": "取得未來 N 天氣象預報，並生成折線圖",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                "city": {"type": "string", "description": "城市名稱，必須用英文表示，例如 Taipei, Kaohsiung, Tainan, Taichung"},
+                "days": {"type": "integer", "minimum": 1, "maximum": 7, "description": "天數"},
+                "show": {"type": "string", "enum": ["weather","rain"], "description": "顯示氣溫或降雨機率"}
+                },
+                "required": ["city"]
+            }
+        },
+
         {
             "name": "get_news",
             "description": "查詢新聞，依指定關鍵字回傳最新新聞列表",
@@ -306,7 +321,7 @@ def azure_openai(user_id):
         conversation_history[user_id].append({"role": "assistant", "content": completion_message.content})
 
     # 多步 function call
-    while getattr(completion_message, "function_call", None):
+    while function_name:                    #getattr(completion_message, "function_call", None):
         this_arguments = json.loads(completion_message.function_call.arguments or "{}")
 
         # -------------------------
@@ -342,6 +357,40 @@ def azure_openai(user_id):
                 "name": function_name,
                 "content": text
             })
+        elif function_name == "get_weather_chart":
+            city = this_arguments.get("city", "未知城市")
+            days = this_arguments.get("days", 7)
+            show = this_arguments.get("show", "weather")
+            
+            # 呼叫取得天氣圖表
+            weather_chart = get_weather_chart(city, days, show)
+
+            if "error" in weather_chart:
+                text = "查詢天氣圖表失敗：" + weather_chart["error"]
+                chart_url = None
+            else:
+                # 組文字訊息
+                lines = [f"{city} 未來 {days} 天預報："]
+                for day in weather_chart.get("預報", []):
+                    lines.append(
+                        f"- {day.get('日期','')} : {day.get('天氣','')}, 高 {day.get('最高氣溫(°C)','N/A')}°C, "
+                        f"低 {day.get('最低氣溫(°C)','N/A')}°C, 降雨機率 {day.get('降雨機率(%)',0)}%"
+                    )
+                text = "\n".join(lines)
+
+                # 圖片 URL 字串
+                chart_path = weather_chart.get("chart_path")
+                chart_url = f"{sever_url}/{chart_path}" if chart_path else None
+
+            # 將文字訊息與圖表 URL 回傳或存入 conversation_history
+            conversation_history[user_id].append({
+                "role": "assistant",
+                "content": json.dumps({
+                    "text": text,
+                    "chart_url": chart_url
+                }, ensure_ascii=False)
+            })
+
 
         # -------------------------
         # get_price
@@ -619,28 +668,39 @@ import requests
 
 def get_weather_chart(city: str, days: int = 7, show: str = "weather") -> dict:
     """
-    取得未來 N 天天氣，生成折線圖
+    取得未來 N 天天氣，並生成折線圖
     :param city: 城市名稱
     :param days: 1~7 天
-    :param show: 'weather' 或 'rain'，決定圖表 y 軸顯示氣溫或降雨機率
-    :return: dict，包含天氣資料與圖檔路徑
+    :param show: "weather"=平均氣溫, "rain"=降雨機率
+    :return: dict
+        {
+            "地點": city,
+            "預報": [...],
+            "chart_path": "static/weather_taipei.png"
+        }
     """
-    import requests, matplotlib.pyplot as plt, os
+    import requests, matplotlib.pyplot as plt, os, matplotlib
+
+    # 設中文字型避免缺字警告
+    matplotlib.rcParams['font.family'] = 'Arial Unicode MS'  # Mac 常用中文字型
+    matplotlib.rcParams['axes.unicode_minus'] = False
 
     url = f"http://api.weatherapi.com/v1/forecast.json?key={weather_api_key}&q={city},Taiwan&days={days}&lang=zh"
+    print(f"city = {city}, days = {days}, show = {show}")
     resp = requests.get(url)
     data = resp.json()
     if resp.status_code != 200 or "error" in data:
         return {"error": data.get("error", {}).get("message", "查詢失敗")}
 
-    forecast_list = []
-    dates, y_values = [], []
-
+    forecast_list, dates, y_values = [], [], []
     for day in data["forecast"]["forecastday"]:
         d = day["date"]
         dates.append(d)
+
         if show == "rain":
-            y = day["day"].get("daily_chance_of_rain", 0)
+            # 計算每日每小時降雨機率平均
+            hourly_chances = [hour.get("chance_of_rain", 0) for hour in day.get("hour", [])]
+            y = round(sum(hourly_chances) / len(hourly_chances), 1) if hourly_chances else 0
         else:
             y = day["day"]["avgtemp_c"]
         y_values.append(y)
@@ -651,30 +711,30 @@ def get_weather_chart(city: str, days: int = 7, show: str = "weather") -> dict:
             "最高氣溫(°C)": day["day"]["maxtemp_c"],
             "最低氣溫(°C)": day["day"]["mintemp_c"],
             "天氣": day["day"]["condition"]["text"],
-            "降雨機率(%)": day["day"].get("daily_chance_of_rain", 0),
+            "降雨機率(%)": y,  # 改成每小時平均
             "平均濕度(%)": day["day"]["avghumidity"]
         })
 
-    # 產生圖表
     plt.figure(figsize=(10,6))
     plt.plot(dates, y_values, marker='o', label=("降雨機率(%)" if show=="rain" else "平均氣溫(°C)"))
     plt.title(f"{city} 未來 {days} 天{'降雨機率' if show=='rain' else '氣溫'}預報")
     plt.xlabel("日期")
     plt.ylabel("值")
+    if show == "rain":
+        plt.ylim(0,100)
+    else:
+        plt.ylim(min(y_values)-5, max(y_values)+5)
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
 
     os.makedirs("static", exist_ok=True)
-    chart_file = f"static/{show.lower()}_{city.lower()}.png"
+    now = datetime.now()
+    chart_file = f"static/{show.lower()}_{city.lower()}_{now.strftime("%Y-%m-%d%H:%M:%S")}.png"
     plt.savefig(chart_file)
     plt.close()
 
-    return {
-        "地點": city,
-        "預報": forecast_list,
-        "chart_path": chart_file
-    }
+    return {"地點": city, "預報": forecast_list, "chart_path": chart_file}
 
 
 def get_news(keyword: str = "中油", limit: int = 5) -> dict:
